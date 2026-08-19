@@ -42,6 +42,10 @@ public:
 	skydio_me_nodeAsset_impl(std::string name);
 	virtual ~skydio_me_nodeAsset_impl();
 
+	/// Publishes the latest X10D telemetry (position, altitude, heading,
+	/// speed) as asset parameters. Intended to be called from the main loop.
+	void publishTelemetry();
+
 private:
   void addBehaviorImplementations();
 };

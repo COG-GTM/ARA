@@ -30,6 +30,7 @@
 #include <skydio_me_nodeAsset_impl.h>
 
 #include <TraverseTo_impl.h>
+#include <SkydioMavlinkClient.h>
 
 skydio_me_nodeAsset_impl::skydio_me_nodeAsset_impl(std::string name) : skydio_me_nodeAsset(name)
 {
@@ -46,6 +47,22 @@ skydio_me_nodeAsset_impl::skydio_me_nodeAsset_impl(std::string name) : skydio_me
 skydio_me_nodeAsset_impl::~skydio_me_nodeAsset_impl()
 {
 
+}
+
+void skydio_me_nodeAsset_impl::publishTelemetry()
+{
+    const skydio::Telemetry telemetry = skydio::SkydioMavlinkClient::instance().getTelemetry();
+
+    if ( !telemetry.positionValid )
+        return;
+
+    nlohmann::json positionJson = geojson::Feature(
+            geojson::Point( telemetry.longitudeDeg, telemetry.latitudeDeg ), nlohmann::json() );
+
+    setAssetParam_position( positionJson );
+    setAssetParam_altitude( telemetry.relAltitudeM );
+    setAssetParam_heading( telemetry.headingDeg );
+    setAssetParam_speed( telemetry.speedMps );
 }
 
 

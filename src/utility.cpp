@@ -56,7 +56,7 @@ Waypoint calculatePointOnLine(Waypoint pt1,Waypoint pt2,double distance)
 	double deltaX,deltaY;
 	double alpha;
 	double nextDx,nextDy;
-	double slope;
+	double slope = 0.0;
 
 	deltaX = pt2.m_x - pt1.m_x;
 	deltaY = pt2.m_y - pt1.m_y;
@@ -117,6 +117,18 @@ MMS::GeoList::List parseWaypointWKTString( const std::string& s )
     return waypoint_list;
 }
 
+namespace
+{
+
+// A GeoJSON position: [lon, lat] (optionally with altitude), both numeric.
+bool isLonLatPair( const nlohmann::json& coord )
+{
+    return coord.is_array() && coord.size() >= 2 &&
+           coord[0].is_number() && coord[1].is_number();
+}
+
+} // namespace
+
 MMS::GeoList::List jsonToGeoList( nlohmann::json& geo_json )
 {
     MMS::GeoList::List geo_list;
@@ -125,11 +137,29 @@ MMS::GeoList::List jsonToGeoList( nlohmann::json& geo_json )
 	if( geo_json.empty() )
 		return geo_list;
 
+    if( !geo_json.is_object() || !geo_json["type"].is_string() )
+    {
+        std::cerr << RED << "[jsonToGeoList] - Malformed GeoJSON, expected an object with a string \"type\"" << NORMAL << std::endl;
+        return geo_list;
+    }
+
     if( equalsIgnoreCase(geo_json["type"], "Feature") )
+    {
         geo_json = geo_json["geometry"];
+        if( !geo_json.is_object() || !geo_json["type"].is_string() )
+        {
+            std::cerr << RED << "[jsonToGeoList] - Malformed GeoJSON Feature, expected a \"geometry\" object" << NORMAL << std::endl;
+            return geo_list;
+        }
+    }
 
     if( equalsIgnoreCase(geo_json["type"], "Point") )
     {
+        if( !isLonLatPair(geo_json["coordinates"]) )
+        {
+            std::cerr << RED << "[jsonToGeoList] - Malformed Point coordinates" << NORMAL << std::endl;
+            return geo_list;
+        }
         waypoint.setLon(geo_json["coordinates"][0]);
         waypoint.setLat(geo_json["coordinates"][1]);
         geo_list.push_back(waypoint);
@@ -138,6 +168,11 @@ MMS::GeoList::List jsonToGeoList( nlohmann::json& geo_json )
     {
         for( nlohmann::json& coord : geo_json["coordinates"] )
         {
+            if( !isLonLatPair(coord) )
+            {
+                std::cerr << RED << "[jsonToGeoList] - Malformed LineString coordinates" << NORMAL << std::endl;
+                return MMS::GeoList::List();
+            }
             waypoint.setLon(coord[0]);
             waypoint.setLat(coord[1]);
             geo_list.push_back(waypoint);
@@ -145,10 +180,20 @@ MMS::GeoList::List jsonToGeoList( nlohmann::json& geo_json )
     }
     else if( equalsIgnoreCase(geo_json["type"], "Polygon") )
     {
+        if( !geo_json["coordinates"].is_array() || geo_json["coordinates"].empty() )
+        {
+            std::cerr << RED << "[jsonToGeoList] - Malformed Polygon coordinates" << NORMAL << std::endl;
+            return geo_list;
+        }
         // Note this only parses the outer linear ring and omits the
         // inner linear ring defining any holes in the polygon
         for( nlohmann::json& coord : geo_json["coordinates"][0] )
         {
+            if( !isLonLatPair(coord) )
+            {
+                std::cerr << RED << "[jsonToGeoList] - Malformed Polygon coordinates" << NORMAL << std::endl;
+                return MMS::GeoList::List();
+            }
             waypoint.setLon(coord[0]);
             waypoint.setLat(coord[1]);
             geo_list.push_back(waypoint);
@@ -333,9 +378,9 @@ std::map<std::string, std::string> parseConfigFile(const std::string& filename)
     {
         c = fgetc(file);
 
-        if( c != '\n' || c == EOF)
+        if( c != '\n' && c != EOF )
         {
-            line += c;
+            line += static_cast<char>( c );
             continue;
         }
 

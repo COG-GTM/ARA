@@ -71,4 +71,15 @@ subset TraverseTo needs, so no external MAVLink library is required.
 
 ## Testing
 
-See [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
+Automated unit/protocol tests (no MPMS SDK or vehicle required — the SDK surface
+used by the behavior code is stubbed under `tests/stubs/`; requires GoogleTest
+and GDAL dev packages):
+
+```
+cmake -S tests -B build-tests
+cmake --build build-tests -j
+ctest --test-dir build-tests --output-on-failure
+```
+
+Full verification plan (unit → simulator → HIL → flight):
+see [docs/TEST_PLAN.md](docs/TEST_PLAN.md).

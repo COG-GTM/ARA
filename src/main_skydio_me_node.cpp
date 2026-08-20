@@ -36,6 +36,7 @@
 #include <iomanip>
 
 #include "skydio_me_nodeAsset_impl.h"
+#include "SkydioMavlinkClient.h"
 #include <UDPCommInterface/UDPCommInterface.h>
 #include "utility.h"
 
@@ -45,6 +46,11 @@ static const std::string ASSET_CLASS = "ASSET_CLASS";
 static const std::string UDP_RX_PORT = "UDP_RX_PORT";
 static const std::string UDP_HOSTS_FILE = "UDP_HOSTS_FILE";
 static const std::string UDP_REPORT_TRAFFIC = "UDP_REPORT_TRAFFIC";
+static const std::string SKYDIO_VEHICLE_IP = "SKYDIO_VEHICLE_IP";
+static const std::string SKYDIO_VEHICLE_PORT = "SKYDIO_VEHICLE_PORT";
+static const std::string SKYDIO_LOCAL_PORT = "SKYDIO_LOCAL_PORT";
+static const std::string SKYDIO_GCS_SYSTEM_ID = "SKYDIO_GCS_SYSTEM_ID";
+static const std::string SKYDIO_TARGET_SYSTEM_ID = "SKYDIO_TARGET_SYSTEM_ID";
 
 
 // Signal handling
@@ -66,12 +72,17 @@ bool configDefaults( std::map<std::string, std::string>& config )
     defaults[ UDP_RX_PORT ]        = "5001";
     defaults[ UDP_HOSTS_FILE ]     = "./hosts.json";
     defaults[ UDP_REPORT_TRAFFIC ] = "false";
+    defaults[ SKYDIO_VEHICLE_IP ]        = "192.168.10.1";
+    defaults[ SKYDIO_VEHICLE_PORT ]      = "14550";
+    defaults[ SKYDIO_LOCAL_PORT ]        = "14551";
+    defaults[ SKYDIO_GCS_SYSTEM_ID ]     = "255";
+    defaults[ SKYDIO_TARGET_SYSTEM_ID ]  = "1";
 
     // add any missing default values to config
     for( const std::pair<std::string,std::string>& entry : defaults )
     {
         std::string key( toUpper( trim( entry.first ) ) );
-        std::string value = (key == UDP_HOSTS_FILE) ? entry.second : toUpper( trim( entry.second ) );
+        std::string value = (key == UDP_HOSTS_FILE || key == SKYDIO_VEHICLE_IP) ? entry.second : toUpper( trim( entry.second ) );
 
         if( config.find( key ) == config.end() )
         {
@@ -136,6 +147,17 @@ int main( int argc, char* argv[] )
             udp_rx_port, config[ UDP_HOSTS_FILE ], "", udp_report_traffic );
     asset.addCommInterface( MMS::CommInterface::Ptr( udpCommInterfacePtr ) );
 
+    // Connect the native RAS-A/MAVLink link to the Skydio X10D
+    auto & drone = skydio::SkydioMavlinkClient::instance();
+    drone.configure( config[ SKYDIO_VEHICLE_IP ],
+                     static_cast<unsigned short>( std::stoul( config[ SKYDIO_VEHICLE_PORT ] ) ),
+                     static_cast<unsigned short>( std::stoul( config[ SKYDIO_LOCAL_PORT ] ) ),
+                     static_cast<uint8_t>( std::stoul( config[ SKYDIO_GCS_SYSTEM_ID ] ) ),
+                     static_cast<uint8_t>( std::stoul( config[ SKYDIO_TARGET_SYSTEM_ID ] ) ) );
+    if ( !drone.connect() )
+        std::cerr << "Failed to open MAVLink UDP link to Skydio X10D at "
+                  << config[ SKYDIO_VEHICLE_IP ] << ":" << config[ SKYDIO_VEHICLE_PORT ] << std::endl;
+
     // set signal handler
     signal( SIGINT, signalHandler );
 
@@ -147,11 +169,14 @@ int main( int argc, char* argv[] )
 
         if ( g_shutdown.load() ) break; // exit normally after SIGINT
 
-        // TODO (codegen):  Add in known asset parameters here at specific rates in the json??
+        // publish X10D telemetry (position, altitude, heading, speed) at 10 Hz
+        asset.publishTelemetry();
     }
 
     // update status
     asset.updateAssetParameter( MMS::Parameter( "status", "string", "SHUTDOWN" ) );
+
+    drone.disconnect();
 
     std::cout << std::endl << "Shutting down skydio_me_node Mission Executor Node ..." << std::endl;
 

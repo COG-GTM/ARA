@@ -25,23 +25,51 @@
 // laws are subject to severe criminal penalties. Disseminate in
 // accordance with provisions of DoD Directive 5230.25."
 
-//  Mission Exceutor Name: skydio_me_node
-//  Description: Generated ME Node
 
-#pragma once
 
-#include <skydio_me_nodeAsset.h>
-#include <thread>
-#include "utility.h"
+#include <skydio_me_nodeAsset_impl.h>
 
-class skydio_me_nodeAsset_impl : public skydio_me_nodeAsset {
-public:
+#include <TraverseTo_impl.h>
+#include <SkydioMavlinkClient.h>
 
-	typedef std::shared_ptr<skydio_me_nodeAsset_impl> Ptr;
+skydio_me_nodeAsset_impl::skydio_me_nodeAsset_impl(std::string name) : skydio_me_nodeAsset(name)
+{
+    addBehaviorImplementations();
 
-	skydio_me_nodeAsset_impl(std::string name);
-	virtual ~skydio_me_nodeAsset_impl();
+    nlohmann::json positionJson = geojson::Feature( geojson::Point( 0.0,0.0 ), nlohmann::json() );
 
-private:
-  void addBehaviorImplementations();
-};
+    setAssetParam_position(positionJson);
+    setAssetParam_heading(0.0);
+    setAssetParam_speed(0.0);
+    setAssetParam_altitude(0.0);
+}
+
+skydio_me_nodeAsset_impl::~skydio_me_nodeAsset_impl()
+{
+
+}
+
+void skydio_me_nodeAsset_impl::publishTelemetry()
+{
+    const skydio::Telemetry telemetry = skydio::SkydioMavlinkClient::instance().getTelemetry();
+
+    if ( !telemetry.positionValid )
+        return;
+
+    nlohmann::json positionJson = geojson::Feature(
+            geojson::Point( telemetry.longitudeDeg, telemetry.latitudeDeg ), nlohmann::json() );
+
+    setAssetParam_position( positionJson );
+    setAssetParam_altitude( telemetry.relAltitudeM );
+    setAssetParam_heading( telemetry.headingDeg );
+    setAssetParam_speed( telemetry.speedMps );
+}
+
+
+void skydio_me_nodeAsset_impl::addBehaviorImplementations()
+{
+    TraverseTo_impl::Ptr traversetoPtr;
+    traversetoPtr.reset(new TraverseTo_impl);
+    addServiceInterface(MMS::ServiceInterface::Ptr(traversetoPtr));
+
+}

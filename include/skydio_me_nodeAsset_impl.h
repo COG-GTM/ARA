@@ -25,34 +25,27 @@
 // laws are subject to severe criminal penalties. Disseminate in
 // accordance with provisions of DoD Directive 5230.25."
 
+//  Mission Exceutor Name: skydio_me_node
+//  Description: Generated ME Node
 
+#pragma once
 
-#include <skydio_me_nodeAsset_impl.h>
+#include <skydio_me_nodeAsset.h>
+#include <thread>
+#include "utility.h"
 
-#include <TraverseTo_impl.h>
+class skydio_me_nodeAsset_impl : public skydio_me_nodeAsset {
+public:
 
-skydio_me_nodeAsset_impl::skydio_me_nodeAsset_impl(std::string name) : skydio_me_nodeAsset(name)
-{
-    addBehaviorImplementations();
+	typedef std::shared_ptr<skydio_me_nodeAsset_impl> Ptr;
 
-    nlohmann::json positionJson = geojson::Feature( geojson::Point( 0.0,0.0 ), nlohmann::json() );
+	skydio_me_nodeAsset_impl(std::string name);
+	virtual ~skydio_me_nodeAsset_impl();
 
-    setAssetParam_position(positionJson);
-    setAssetParam_heading(0.0);
-    setAssetParam_speed(0.0);
-    setAssetParam_altitude(0.0);
-}
+	/// Publishes the latest X10D telemetry (position, altitude, heading,
+	/// speed) as asset parameters. Intended to be called from the main loop.
+	void publishTelemetry();
 
-skydio_me_nodeAsset_impl::~skydio_me_nodeAsset_impl()
-{
-
-}
-
-
-void skydio_me_nodeAsset_impl::addBehaviorImplementations()
-{
-    TraverseTo_impl::Ptr traversetoPtr;
-    traversetoPtr.reset(new TraverseTo_impl);
-    addServiceInterface(MMS::ServiceInterface::Ptr(traversetoPtr));
-
-}
+private:
+  void addBehaviorImplementations();
+};

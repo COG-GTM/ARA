@@ -29,7 +29,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #include "TraverseToInterface.h"
+#include "SkydioMavlinkClient.h"
 #include "utility.h"
 
 class TraverseTo_impl : public TraverseToInterface
@@ -40,16 +46,37 @@ public:
     typedef std::shared_ptr<TraverseTo_impl const> ConstPtr;
 
     TraverseTo_impl();
-    virtual ~TraverseTo_impl() {};
+    virtual ~TraverseTo_impl();
 
     virtual void user_configure();
     virtual void user_unconfigure();
     virtual MMS::ServiceInterface::Ptr clone() const;
 
-     virtual void userSignal_handlestart(const startInputSignalData & signalData);
-     virtual void userSignal_handleupdate(const updateInputSignalData & signalData);
+    virtual void userSignal_handlestart(const startInputSignalData & signalData);
+    virtual void userSignal_handleupdate(const updateInputSignalData & signalData);
     virtual void userSignal_handlepause();
     virtual void userSignal_handleresume();
     virtual void userSignal_handlestop();
 
+private:
+
+    /// Extracts a waypoint list from behavior signal data or config parameters.
+    MMS::GeoList::List resolveWaypoints(const nlohmann::json & signalJson);
+
+    /// Builds the MAVLink flight plan (takeoff + speed + waypoints) from lat/lon points.
+    std::vector<skydio::MissionItem> buildFlightPlan(const MMS::GeoList::List & waypoints) const;
+
+    /// Worker thread: uploads the plan, starts the mission, monitors progress,
+    /// and fires WaypointListComplete when the final waypoint is reached.
+    void executeMission(std::vector<skydio::MissionItem> flightPlan);
+
+    void stopWorker();
+
+    std::thread       m_missionThread;
+    std::atomic<bool> m_stopRequested{ false };
+    std::atomic<bool> m_missionActive{ false };
+    std::mutex        m_missionMutex;
+
+    float m_altitude_m = 20.f;
+    float m_speed_mps  = 2.f;
 };

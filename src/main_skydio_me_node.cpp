@@ -72,8 +72,9 @@ bool configDefaults( std::map<std::string, std::string>& config )
     defaults[ UDP_RX_PORT ]        = "5001";
     defaults[ UDP_HOSTS_FILE ]     = "./hosts.json";
     defaults[ UDP_REPORT_TRAFFIC ] = "false";
-    defaults[ SKYDIO_VEHICLE_IP ]        = "192.168.10.1";
-    defaults[ SKYDIO_VEHICLE_PORT ]      = "14550";
+    // X10D Control and Telemetry ICD / RAS-A default MAVLink endpoint (UDP)
+    defaults[ SKYDIO_VEHICLE_IP ]        = "192.168.42.10";
+    defaults[ SKYDIO_VEHICLE_PORT ]      = "15667";
     defaults[ SKYDIO_LOCAL_PORT ]        = "14551";
     defaults[ SKYDIO_GCS_SYSTEM_ID ]     = "255";
     defaults[ SKYDIO_TARGET_SYSTEM_ID ]  = "1";

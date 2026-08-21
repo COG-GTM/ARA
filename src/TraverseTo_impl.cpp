@@ -306,6 +306,8 @@ void TraverseTo_impl::userSignal_handlestop()
 
     auto & drone = skydio::SkydioMavlinkClient::instance();
     drone.pauseMission();          // hold in place
-    drone.clearMission( std::chrono::seconds( 5 ) ); // remove the uploaded plan
+    if ( !drone.clearMission( std::chrono::seconds( 15 ) ) ) // remove the uploaded plan
+        std::cerr << RED << "[TraverseTo_impl] MISSION_CLEAR_ALL failed after retries; "
+                     "vehicle is holding but the uploaded plan may remain onboard" << NORMAL << std::endl;
     setStatus( "PENDING" );
 }

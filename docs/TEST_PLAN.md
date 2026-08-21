@@ -83,36 +83,78 @@ a simulator/HIL check:
 Requires a physical X10D and the proprietary MPMS SDK runtime. With an X10D on
 the bench connected over the configured UDP link:
 
-1. Confirm the vehicle's RAS-A heartbeat is decoded (system id matches
-   `SKYDIO_TARGET_SYSTEM_ID`).
-2. Upload a 3-waypoint plan; confirm acceptance in the Skydio Enterprise
+### Connection and discovery
+
+1. Confirm the node connects to the X10D at the ICD default endpoint
+   `192.168.42.10:15667/UDP` with no configuration overrides, and that an
+   explicitly configured `SKYDIO_VEHICLE_IP`/`SKYDIO_VEHICLE_PORT` overrides it.
+2. Confirm the vehicle's RAS-A heartbeat is decoded (system id matches
+   `SKYDIO_TARGET_SYSTEM_ID`) and target-system discovery is stable across
+   node restarts.
+
+### Command and mission handling
+
+3. Issue an ARM (`MAV_CMD_COMPONENT_ARM_DISARM`) and record the real
+   `COMMAND_ACK` sequence — specifically whether the X10D emits
+   `MAV_RESULT_IN_PROGRESS` before the terminal ACK, and how long arming takes.
+4. Upload a 3+ waypoint plan; confirm acceptance in the Skydio Enterprise
    controller/Cloud UI.
-3. Issue `pause`/`resume`/`stop` and confirm `COMMAND_ACK` results are `ACCEPTED`.
-4. Verify telemetry matches the controller's displayed position/heading.
+5. Issue `pause`/`resume`/`stop` and confirm `COMMAND_ACK` results are `ACCEPTED`.
+6. Verify telemetry (position, altitude, heading, speed) agrees with the
+   Skydio controller's display.
 
-Additional bench-only checks the loopback suite cannot provide:
+### Bench-only protocol checks the loopback suite cannot provide
 
-5. Confirm the X10D actually answers `MISSION_COUNT` with `MISSION_REQUEST_INT`
+7. Confirm the X10D actually answers `MISSION_COUNT` with `MISSION_REQUEST_INT`
    (vs. the legacy float `MISSION_REQUEST`, which the node also answers with
    `MISSION_ITEM_INT`) and accepts `MAV_FRAME_GLOBAL_RELATIVE_ALT_INT`.
-6. Confirm the X10D's RAS-A profile accepts `MAV_CMD_NAV_TAKEOFF` as mission
-   item 0 while on the ground, and its behavior when already airborne.
-7. Confirm `MAV_CMD_DO_PAUSE_CONTINUE` hold/continue semantics on the X10D
+8. Confirm the X10D's RAS-A profile accepts `MAV_CMD_NAV_TAKEOFF` as mission
+   item 0 while on the ground, and its behavior when already airborne
+   (takeoff item should be skipped/accepted without landing first).
+9. Confirm `MAV_CMD_DO_PAUSE_CONTINUE` hold/continue semantics on the X10D
    (hold position vs. loiter behavior) and that `MISSION_CLEAR_ALL` while
    holding does not trigger RTL.
+
+### Packet-loss / retry injection (bench, where practical)
+
+Using a UDP impairment tool (e.g. `tc netem` loss on the link, or an
+interposing proxy) inject loss during each Mission Protocol stage and verify
+retries occur within the RAS-A bounds (~250 ms item timing, ~1500 ms protocol
+timing, max 5 retries) and that failure is cleanly reported (status returns to
+`PENDING`, no `MISSION_START`) after retry exhaustion:
+
+10. Drop the initial `MISSION_COUNT` — node re-announces.
+11. Drop a `MISSION_REQUEST_INT` from the vehicle — node retransmits the
+    previous item (or `MISSION_COUNT` if no item sent yet).
+12. Drop a `MISSION_ITEM_INT` — vehicle re-requests; node answers the
+    duplicate request.
+13. Drop the final `MISSION_ACK` — node retransmits the last item until the
+    ACK arrives or retries are exhausted.
+14. Drop `MISSION_CLEAR_ALL` / its ACK — node retries the clear; after
+    exhaustion `stop` still holds the vehicle and reports the failure.
 
 ## Stage 4 — Flight test — NOT AUTOMATABLE HERE
 
 In a cleared test area, execute a full MPMS mission: send `start` with a 3–5 waypoint
 LineString at a safe altitude (e.g. 30 m AGL):
 
-1. Vehicle takes off, flies waypoints in order at the commanded speed.
-2. `pause` mid-leg → vehicle holds; `resume` → continues from the same leg.
-3. `update` with a diverted route → vehicle flies the new list.
-4. `stop` → vehicle holds and the plan is cleared (vehicle remains under
-   operator control for landing/RTL).
-5. On final waypoint arrival, `WaypointListComplete` is received by the MPMS
-   mission manager and status reads `COMPLETE`.
+1. Vehicle takes off (`NAV_TAKEOFF` while landed), flies waypoints in the
+   expected order.
+2. Vehicle holds the requested altitude (`altitude_m`) and the requested speed
+   (`DO_CHANGE_SPEED` value) within tolerance, verified against controller
+   telemetry.
+3. `pause` mid-leg → vehicle holds; `resume` → continues from the same leg.
+4. `update` with a diverted route while the mission is active → vehicle flies
+   the new list without corrupting mission state.
+5. `stop` while traversing → vehicle holds and the plan is cleared
+   (`MISSION_CLEAR_ALL`); verify NO unexpected RTL, landing, or continued
+   mission execution after the stop (vehicle remains under operator control
+   for landing/RTL).
+6. On final waypoint arrival, `WaypointListComplete` is received by the MPMS
+   mission manager exactly once and status reads `COMPLETE`.
+7. Repeat one upload with induced packet loss (weak-link placement or
+   impairment tool) and confirm the mission still uploads via retries or
+   fails cleanly without partial execution.
 
 ## Pass/fail criteria
 

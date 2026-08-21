@@ -63,10 +63,16 @@ constexpr uint8_t MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = 6;
 constexpr uint8_t MAV_MISSION_TYPE_MISSION          = 0;
 constexpr uint8_t MAV_MISSION_ACCEPTED              = 0;
 constexpr uint8_t MAV_RESULT_ACCEPTED               = 0;
+constexpr uint8_t MAV_RESULT_IN_PROGRESS            = 5;
 constexpr uint8_t MAV_TYPE_GCS                      = 6;
 constexpr uint8_t MAV_AUTOPILOT_INVALID             = 8;
 constexpr uint8_t MAV_STATE_ACTIVE                  = 4;
 constexpr uint8_t MAV_MODE_FLAG_SAFETY_ARMED        = 0x80;
+
+// ---- RAS-A ICD retry/timing guidance ----
+constexpr std::chrono::milliseconds MISSION_ITEM_RESPONSE_TIMEOUT{ 250 };   // mission-item exchanges
+constexpr std::chrono::milliseconds PROTOCOL_RESPONSE_TIMEOUT{ 1500 };      // normal protocol exchanges
+constexpr int MISSION_MAX_RETRIES = 5;
 
 /// One entry of a MAVLink flight plan (maps 1:1 onto MISSION_ITEM_INT).
 struct MissionItem
@@ -109,6 +115,11 @@ struct Telemetry
 class SkydioMavlinkClient
 {
 public:
+    SkydioMavlinkClient() = default;
+    ~SkydioMavlinkClient();
+    SkydioMavlinkClient( const SkydioMavlinkClient & ) = delete;
+    SkydioMavlinkClient & operator=( const SkydioMavlinkClient & ) = delete;
+
     static SkydioMavlinkClient & instance();
 
     // Must be called before connect().
@@ -117,6 +128,12 @@ public:
                     unsigned short localPort,
                     uint8_t gcsSystemId,
                     uint8_t targetSystemId );
+
+    const std::string & vehicleIp() const   { return m_vehicleIp; }
+    unsigned short vehiclePort() const      { return m_vehiclePort; }
+    unsigned short localPort() const        { return m_localPort; }
+    uint8_t gcsSystemId() const             { return m_systemId; }
+    uint8_t targetSystemId() const          { return m_targetSystem; }
 
     bool connect();
     void disconnect();
@@ -154,11 +171,6 @@ public:
     void resetMissionProgress();
 
 private:
-    SkydioMavlinkClient() = default;
-    ~SkydioMavlinkClient();
-    SkydioMavlinkClient( const SkydioMavlinkClient & ) = delete;
-    SkydioMavlinkClient & operator=( const SkydioMavlinkClient & ) = delete;
-
     // framing
     void sendMessage( uint32_t msgId, const uint8_t * payload, uint8_t length );
     void sendHeartbeat();
@@ -173,8 +185,9 @@ private:
     static uint16_t crcExtra( uint32_t msgId );
 
     // configuration
-    std::string    m_vehicleIp   = "192.168.10.1";
-    unsigned short m_vehiclePort = 14550;
+    // Skydio X10D Control and Telemetry ICD default MAVLink endpoint.
+    std::string    m_vehicleIp   = "192.168.42.10";
+    unsigned short m_vehiclePort = 15667;
     unsigned short m_localPort   = 14550;
     uint8_t        m_systemId    = 255; // GCS-side system id
     uint8_t        m_componentId = 190; // MAV_COMP_ID_MISSIONPLANNER
@@ -195,6 +208,7 @@ private:
     std::condition_variable m_stateCondition;
     Telemetry               m_telemetry;
     int                     m_missionRequestSeq = -1; // last MISSION_REQUEST(_INT) seq
+    uint64_t                m_missionRequestCounter = 0; // increments per request (detects duplicates)
     int                     m_missionAckType    = -1; // last MISSION_ACK type
     int                     m_commandAckCmd     = -1; // last COMMAND_ACK command
     int                     m_commandAckResult  = -1; // last COMMAND_ACK result

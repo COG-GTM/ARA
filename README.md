@@ -1,85 +1,75 @@
 # skydio_me_node — Skydio X10D Mission Executor
 
-MPMS Mission Executor (ME) node that commands a Skydio X10D to traverse a set of
-waypoints. It bridges the abstract MPMS `TraverseTo` behavior to the X10D's native
-RAS-A/MAVLink control link (see the "X10D Control and Telemetry ICD").
+An MPMS Mission Executor (ME) node that commands a Skydio X10D to traverse a set
+of waypoints. It translates the abstract MPMS `TraverseTo` behavior into the
+X10D's native RAS-A/MAVLink v2 protocol (per the "X10D Control and Telemetry ICD").
 
-## Layout
+## What's in this repo
 
-Per the MPMS Integration Toolkit workflow, generated files are separated from
-developer-editable files:
+**Implementation** (developer-editable code, per the MPMS Integration Toolkit workflow):
 
-```
-gen_include/  Generated behavior/asset interfaces (do not edit)
-  TraverseToInterface.h     TraverseTo behavior interface (signals, config params)
-  skydio_me_nodeAsset.h     Asset interface (position/altitude/heading/speed params)
-gen_src/
-  skydio_me_nodeAsset.cpp   Generated asset implementation (do not edit)
-include/      Developer-editable headers
-  TraverseTo_impl.h         TraverseTo behavior implementation
-  SkydioMavlinkClient.h     Native RAS-A/MAVLink v2 UDP driver for the X10D
-  skydio_me_nodeAsset_impl.h, utility.h, UTM.h
-src/          Developer-editable sources
-  TraverseTo_impl.cpp       start/update/pause/resume/stop handlers -> MAVLink
-  SkydioMavlinkClient.cpp   Mission Protocol upload, COMMAND_LONG, telemetry decode
-  main_skydio_me_node.cpp   Node entry point (config, comms, 10 Hz telemetry loop)
-  skydio_me_nodeAsset_impl.cpp, utility.cpp, UTM.cpp
-docs/
-  TEST_PLAN.md              Verification plan (unit -> simulator -> HIL -> flight)
-```
-
-## Behavior → native protocol mapping
-
-| MPMS `TraverseTo` | Skydio X10D (RAS-A/MAVLink) |
+| File | Purpose |
 |---|---|
-| `start` | Mission Protocol upload (`MISSION_COUNT`/`MISSION_ITEM_INT`/`MISSION_ACK`), `MAV_CMD_COMPONENT_ARM_DISARM`, `MAV_CMD_MISSION_START` |
-| `update` | hold + re-upload + restart with new waypoint list |
+| `src/TraverseTo_impl.cpp` | The `TraverseTo` behavior: implements the `start`/`update`/`pause`/`resume`/`stop` signal handlers and fires `WaypointListComplete` when the traverse finishes |
+| `src/SkydioMavlinkClient.cpp` | Self-contained MAVLink v2 UDP driver: framing + CRC, mission upload handshake, `COMMAND_LONG` with ACK/retry, telemetry decode (no external MAVLink library needed) |
+| `src/skydio_me_nodeAsset_impl.cpp` | Publishes the required asset parameters (`position`, `altitude`, `heading`, `speed`) from X10D telemetry at 10 Hz |
+| `src/main_skydio_me_node.cpp` | Node entry point: config, MPMS comms, telemetry loop |
+
+Generated files live in `gen_include/` and `gen_src/` and are **never edited**.
+
+**Tests** (`tests/`, GoogleTest — run without the MPMS SDK or a vehicle):
+
+- `test_mavlink_client.cpp` — protocol-level: MAVLink framing/CRC, `MISSION_ITEM_INT`
+  encoding, upload handshake (incl. rejection/timeout/retry), command ACK semantics,
+  telemetry conversion, corrupt-frame handling
+- `test_traverse_to.cpp` — behavior-level: full start → upload → arm → start →
+  complete lifecycle through the real handlers, pause/resume/stop/update traffic,
+  malformed-input rejection
+- `test_utility.cpp` — GeoJSON parsing and geometry/config helpers
+- `FakeVehicle.h` — loopback UDP vehicle with an independent MAVLink decoder,
+  so encoder bugs can't self-verify; `stubs/` stands in for the proprietary MPMS SDK
+
+## Behavior → protocol mapping
+
+| MPMS `TraverseTo` signal | Native X10D messages |
+|---|---|
+| `start` | Mission upload (`MISSION_COUNT` → `MISSION_ITEM_INT` → `MISSION_ACK`), then arm + `MAV_CMD_MISSION_START` |
+| `update` | Hold, re-upload the new waypoint list, restart |
 | `pause` / `resume` | `MAV_CMD_DO_PAUSE_CONTINUE` (param1 = 0 / 1) |
-| `stop` | hold + `MISSION_CLEAR_ALL` |
-| `WaypointListComplete` | fired when `MISSION_ITEM_REACHED` reports the final item |
-| asset telemetry | `GLOBAL_POSITION_INT` → `position`, `altitude`, `heading`, `speed` |
+| `stop` | Hold + `MISSION_CLEAR_ALL` |
+| `WaypointListComplete` | Fired when `MISSION_ITEM_REACHED` reports the final waypoint |
 
-Waypoints arrive as GeoJSON (Point/LineString/Polygon Feature) via the `start`/`update`
-signal data or the `waypoint_list` config parameter, and are encoded as
-`MISSION_ITEM_INT` items in `MAV_FRAME_GLOBAL_RELATIVE_ALT_INT` at the configured
-`altitude_m` and `speed_mps` (clamped to `[minVelocity_mps, maxVelocity_mps]`).
+Waypoints arrive as GeoJSON (via signal data or the `waypoint_list` config param)
+and are flown at the configured `altitude_m` and `speed_mps` (clamped to
+`[minVelocity_mps, maxVelocity_mps]`).
 
-## Configuration (`skydio_me_node.cfg`)
+## Running the tests
 
-| Key | Default | Description |
-|---|---|---|
-| `UDP_RX_PORT`, `UDP_HOSTS_FILE` | `5001`, `./hosts.json` | MPMS-side comms |
-| `SKYDIO_VEHICLE_IP` | `192.168.42.10` | X10D control link address |
-| `SKYDIO_VEHICLE_PORT` | `15667` | X10D MAVLink UDP port |
-| `SKYDIO_LOCAL_PORT` | `14551` | Local bind port for the MAVLink socket |
-| `SKYDIO_GCS_SYSTEM_ID` | `255` | System id this node uses on the link |
-| `SKYDIO_TARGET_SYSTEM_ID` | `1` | X10D system id |
+Requires CMake, GoogleTest, and GDAL dev packages:
 
-## Building
-
-Requires the MPMS SDK (`MMSLib`, `MMSTypes`, `UDPCommInterface`), nlohmann/json, and
-GDAL (for `UTM.cpp`). Compile all files under `src/` and `gen_src/` with `include/` and
-`gen_include/` on the include path, e.g.:
-
-```
-g++ -std=c++14 -Iinclude -Igen_include $(MPMS_SDK_FLAGS) src/*.cpp gen_src/*.cpp \
-    -o skydio_me_node -lpthread
-```
-
-`SkydioMavlinkClient` is a self-contained MAVLink v2 encoder/decoder for the message
-subset TraverseTo needs, so no external MAVLink library is required.
-
-## Testing
-
-Automated unit/protocol tests (no MPMS SDK or vehicle required — the SDK surface
-used by the behavior code is stubbed under `tests/stubs/`; requires GoogleTest
-and GDAL dev packages):
-
-```
+```sh
 cmake -S tests -B build-tests
 cmake --build build-tests -j
 ctest --test-dir build-tests --output-on-failure
 ```
 
-Full verification plan (unit → simulator → HIL → flight):
-see [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
+## Building the node
+
+Requires the MPMS SDK (`MMSLib`, `MMSTypes`, `UDPCommInterface`), nlohmann/json,
+and GDAL. Compile everything under `src/` and `gen_src/` with `include/` and
+`gen_include/` on the include path.
+
+Runtime configuration (`skydio_me_node.cfg`): `SKYDIO_VEHICLE_IP` (default
+`192.168.42.10`), `SKYDIO_VEHICLE_PORT` (`15667`), `SKYDIO_LOCAL_PORT` (`14551`),
+`SKYDIO_GCS_SYSTEM_ID` (`255`), `SKYDIO_TARGET_SYSTEM_ID` (`1`), plus MPMS-side
+`UDP_RX_PORT` (`5001`) and `UDP_HOSTS_FILE` (`./hosts.json`).
+
+## Further testing
+
+The unit and protocol stages above are automated here. Remaining stages need
+hardware — see [docs/TEST_PLAN.md](docs/TEST_PLAN.md):
+
+1. **Bench HIL** (X10D, props removed): confirm the real vehicle accepts the
+   mission upload, takeoff item, and hold/clear semantics
+2. **Live flight**: full waypoint traversal exercising pause/resume/update/stop
+   and the completion signal

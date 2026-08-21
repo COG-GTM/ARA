@@ -16,9 +16,20 @@ Behavior-to-protocol mapping under test:
 | completion | `MISSION_ITEM_REACHED` (final seq) → `WaypointListComplete` output signal fired from the mission worker thread |
 | telemetry | `HEARTBEAT`, `GLOBAL_POSITION_INT` → asset params `position`, `altitude`, `heading`, `speed` |
 
-## Stage 1 — Unit tests (no vehicle)
+## Stage 1 — Unit tests (no vehicle) — AUTOMATED
 
-Framing and encoding, testable with a loopback UDP socket:
+Implemented in `tests/` (GoogleTest, no MPMS SDK or vehicle required; the small SDK
+surface used by the behavior code is stubbed under `tests/stubs/`). Run with:
+
+```sh
+cmake -S tests -B build-tests
+cmake --build build-tests -j
+ctest --test-dir build-tests --output-on-failure
+```
+
+Framing and encoding, tested with a loopback UDP socket (`tests/FakeVehicle.h`
+decodes every frame with an independent table-driven CRC-16/MCRF4XX
+implementation and the standard `CRC_EXTRA` seeds):
 
 1. **MAVLink v2 framing** — capture frames emitted by `SkydioMavlinkClient` and assert:
    magic `0xFD`, correct payload length after zero-truncation, little-endian field order,
@@ -36,12 +47,18 @@ Framing and encoding, testable with a loopback UDP socket:
 5. **Telemetry decode** — feed canned `GLOBAL_POSITION_INT`, `HEARTBEAT`,
    `MISSION_CURRENT`, `MISSION_ITEM_REACHED`, `COMMAND_ACK`, `MISSION_ACK` payloads
    into the decoder and assert the `Telemetry` snapshot and ack state.
+6. **Robustness** — garbage datagrams, wrong-magic frames, truncated headers, and
+   CRC-corrupted frames are discarded without affecting later valid frames;
+   zero-truncated payloads (e.g. `MISSION_ACK` with `type == 0`) decode correctly.
 
-## Stage 2 — Protocol tests against a MAVLink simulator
+## Stage 2 — Protocol transaction tests — AUTOMATED (scripted vehicle)
 
-Run `skydio_me_node` against a RAS-A-compatible SITL endpoint (or a scripted
-`pymavlink` responder standing in for the X10D) with `SKYDIO_VEHICLE_IP/PORT`
-pointed at the simulator:
+Automated in the same suite (`tests/test_mavlink_client.cpp`,
+`tests/test_traverse_to.cpp`) using a scripted loopback stand-in for the X10D
+that runs the vehicle side of the Mission Protocol. Items 1–6 below are covered
+there end-to-end through the real `TraverseTo_impl` signal handlers; item 7
+(asset-parameter publication) still requires the MPMS SDK runtime and remains
+a simulator/HIL check:
 
 1. **Heartbeat exchange** — node emits a 1 Hz GCS `HEARTBEAT`; vehicle heartbeat sets
    `heartbeatOk`; loss of heartbeat for >5 s clears it and is logged.
@@ -61,9 +78,10 @@ pointed at the simulator:
    node's asset params update at 10 Hz with correct unit conversions
    (lat/lon 1e-7 deg, alt mm→m, vel cm/s→m/s, hdg cdeg→deg).
 
-## Stage 3 — Hardware-in-the-loop (bench, props removed)
+## Stage 3 — Hardware-in-the-loop (bench, props removed) — NOT AUTOMATABLE HERE
 
-With an X10D on the bench connected over the configured UDP link:
+Requires a physical X10D and the proprietary MPMS SDK runtime. With an X10D on
+the bench connected over the configured UDP link:
 
 1. Confirm the vehicle's RAS-A heartbeat is decoded (system id matches
    `SKYDIO_TARGET_SYSTEM_ID`).
@@ -72,7 +90,18 @@ With an X10D on the bench connected over the configured UDP link:
 3. Issue `pause`/`resume`/`stop` and confirm `COMMAND_ACK` results are `ACCEPTED`.
 4. Verify telemetry matches the controller's displayed position/heading.
 
-## Stage 4 — Flight test
+Additional bench-only checks the loopback suite cannot provide:
+
+5. Confirm the X10D actually answers `MISSION_COUNT` with `MISSION_REQUEST_INT`
+   (vs. the legacy float `MISSION_REQUEST`, which the node also answers with
+   `MISSION_ITEM_INT`) and accepts `MAV_FRAME_GLOBAL_RELATIVE_ALT_INT`.
+6. Confirm the X10D's RAS-A profile accepts `MAV_CMD_NAV_TAKEOFF` as mission
+   item 0 while on the ground, and its behavior when already airborne.
+7. Confirm `MAV_CMD_DO_PAUSE_CONTINUE` hold/continue semantics on the X10D
+   (hold position vs. loiter behavior) and that `MISSION_CLEAR_ALL` while
+   holding does not trigger RTL.
+
+## Stage 4 — Flight test — NOT AUTOMATABLE HERE
 
 In a cleared test area, execute a full MPMS mission: send `start` with a 3–5 waypoint
 LineString at a safe altitude (e.g. 30 m AGL):

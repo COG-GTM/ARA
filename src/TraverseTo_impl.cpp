@@ -161,6 +161,13 @@ std::vector<skydio::MissionItem> TraverseTo_impl::buildFlightPlan(const MMS::Geo
 void TraverseTo_impl::executeMission(std::vector<skydio::MissionItem> flightPlan)
 {
     auto & drone = skydio::SkydioMavlinkClient::instance();
+
+    if ( flightPlan.empty() )
+    {
+        m_missionActive.store( false );
+        return;
+    }
+
     const uint16_t lastSeq = flightPlan.back().seq;
 
     setStatus( "EXECUTING_NOMINAL" );

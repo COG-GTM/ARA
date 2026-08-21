@@ -12,7 +12,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(skydio_me_node_tests)
 
-set(CMAKE_CXX_STANDARD 17)
+# Match the production ME build (C++14); tests must not rely on newer features.
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)

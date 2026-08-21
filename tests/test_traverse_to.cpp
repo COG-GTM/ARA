@@ -91,6 +91,8 @@ public:
         return m_sawClearAll;
     }
 
+    void setAckClearAll( bool ack ) { m_ackClearAll.store( ack ); }
+
     void sendItemReached( uint16_t seq )
     {
         std::vector<uint8_t> payload( 2, 0 );
@@ -211,6 +213,8 @@ private:
                         std::lock_guard<std::mutex> lock( m_mutex );
                         m_sawClearAll = true;
                     }
+                    if ( !m_ackClearAll.load() )
+                        break; // simulated ACK loss
                     std::vector<uint8_t> ack( 3, 0 );
                     ack[0] = 255;
                     ack[1] = 190;
@@ -258,6 +262,7 @@ private:
     std::vector<std::pair<uint16_t, float>> m_commandParams;
     int                       m_uploadsCompleted = 0;
     bool                      m_sawClearAll      = false;
+    std::atomic<bool>         m_ackClearAll{ true };
 };
 
 class TraverseToTest : public ::testing::Test
@@ -472,6 +477,90 @@ TEST_F( TraverseToTest, UpdateReuploadsNewPlan )
 
     m_vehicle->sendItemReached( 2 ); // last seq of the 3-item updated plan
     EXPECT_TRUE( waitForStatus( "TASK_COMPLETE" ) );
+}
+
+TEST_F( TraverseToTest, DuplicateFinalReachedFiresCompletionOnce )
+{
+    invokeStart( TWO_WAYPOINTS );
+    ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_MISSION_START ) );
+
+    m_vehicle->sendItemReached( 3 );
+    EXPECT_TRUE( waitForStatus( "TASK_COMPLETE" ) );
+
+    // Duplicate final MISSION_ITEM_REACHED after completion.
+    m_vehicle->sendItemReached( 3 );
+    std::this_thread::sleep_for( 1s );
+
+    const auto fired = m_behavior->testFiredSignals();
+    ASSERT_EQ( fired.size(), 1u );
+    EXPECT_EQ( fired[0], "WaypointListComplete" );
+}
+
+TEST_F( TraverseToTest, StopPreventsLaterCompletion )
+{
+    invokeStart( TWO_WAYPOINTS );
+    ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_MISSION_START ) );
+
+    m_behavior->testInvokeIncomingSignal( "stop", {} );
+    EXPECT_TRUE( waitForStatus( "TASK_PENDING" ) );
+
+    // A late final-waypoint report must not emit a stale completion.
+    m_vehicle->sendItemReached( 3 );
+    std::this_thread::sleep_for( 1s );
+    EXPECT_TRUE( m_behavior->testFiredSignals().empty() );
+    EXPECT_EQ( m_behavior->testStatusValue( "status" ), "TASK_PENDING" );
+}
+
+TEST_F( TraverseToTest, PauseAndResumeDoNotComplete )
+{
+    invokeStart( TWO_WAYPOINTS );
+    ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_MISSION_START ) );
+
+    m_behavior->testInvokeIncomingSignal( "pause", {} );
+    ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_DO_PAUSE_CONTINUE ) );
+    m_behavior->testInvokeIncomingSignal( "resume", {} );
+
+    EXPECT_FALSE( waitForStatus( "TASK_COMPLETE", 1000ms ) );
+    EXPECT_TRUE( m_behavior->testFiredSignals().empty() );
+
+    m_vehicle->sendItemReached( 3 );
+    EXPECT_TRUE( waitForStatus( "TASK_COMPLETE" ) );
+}
+
+TEST_F( TraverseToTest, StopSafeWhenClearAllUltimatelyFails )
+{
+    invokeStart( TWO_WAYPOINTS );
+    ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_MISSION_START ) );
+
+    m_vehicle->setAckClearAll( false ); // vehicle never ACKs the clear
+    m_behavior->testInvokeIncomingSignal( "stop", {} );
+
+    // Stop must still hold the vehicle, exhaust the bounded clear retries,
+    // reset the status, and never report completion.
+    EXPECT_TRUE( waitForStatus( "TASK_PENDING", 30000ms ) );
+    EXPECT_TRUE( m_vehicle->sawClearAll() );
+    EXPECT_TRUE( m_behavior->testFiredSignals().empty() );
+}
+
+TEST_F( TraverseToTest, RepeatedStartStopCyclesStayConsistent )
+{
+    for ( int cycle = 1; cycle <= 2; ++cycle )
+    {
+        invokeStart( TWO_WAYPOINTS );
+        ASSERT_TRUE( m_vehicle->waitForUploads( cycle ) );
+        ASSERT_TRUE( m_vehicle->waitForCommand( skydio::MAV_CMD_MISSION_START ) );
+        m_behavior->testInvokeIncomingSignal( "stop", {} );
+        ASSERT_TRUE( waitForStatus( "TASK_PENDING" ) );
+    }
+
+    // A final run must still complete exactly once.
+    invokeStart( TWO_WAYPOINTS );
+    ASSERT_TRUE( m_vehicle->waitForUploads( 3 ) );
+    m_vehicle->sendItemReached( 3 );
+    EXPECT_TRUE( waitForStatus( "TASK_COMPLETE" ) );
+    const auto fired = m_behavior->testFiredSignals();
+    ASSERT_EQ( fired.size(), 1u );
+    EXPECT_EQ( fired[0], "WaypointListComplete" );
 }
 
 TEST_F( TraverseToTest, SpeedClampedToConfiguredBounds )

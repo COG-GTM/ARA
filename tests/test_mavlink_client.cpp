@@ -439,4 +439,347 @@ TEST_F( MavlinkClientTest, SurvivesMalformedAndCorruptedFrames )
     EXPECT_EQ( client().getTelemetry().reachedSeq, 7 );
 }
 
+// ---- endpoint configuration -------------------------------------------------
+
+TEST( MavlinkClientConfigTest, DefaultEndpointMatchesX10dIcd )
+{
+    skydio::SkydioMavlinkClient fresh;
+    EXPECT_EQ( fresh.vehicleIp(), "192.168.42.10" );
+    EXPECT_EQ( fresh.vehiclePort(), 15667 );
+    EXPECT_EQ( fresh.gcsSystemId(), 255 );
+    EXPECT_EQ( fresh.targetSystemId(), 1 );
+}
+
+TEST( MavlinkClientConfigTest, ConfiguredEndpointOverridesDefault )
+{
+    skydio::SkydioMavlinkClient fresh;
+    fresh.configure( "10.1.2.3", 14550, 14551, 250, 7 );
+    EXPECT_EQ( fresh.vehicleIp(), "10.1.2.3" );
+    EXPECT_EQ( fresh.vehiclePort(), 14550 );
+    EXPECT_EQ( fresh.localPort(), 14551 );
+    EXPECT_EQ( fresh.gcsSystemId(), 250 );
+    EXPECT_EQ( fresh.targetSystemId(), 7 );
+}
+
+// ---- MAV_RESULT_IN_PROGRESS -------------------------------------------------
+
+TEST_F( MavlinkClientTest, ArmInProgressThenAcceptedSucceeds )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().arm( true ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_IN_PROGRESS ) );
+    std::this_thread::sleep_for( 500ms );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+
+    // IN_PROGRESS must not have triggered a retransmission.
+    Frame extra;
+    EXPECT_FALSE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, extra, 500ms ) );
+}
+
+TEST_F( MavlinkClientTest, ArmMultipleInProgressThenAcceptedSucceeds )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().arm( true ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    for ( int i = 0; i < 3; ++i )
+    {
+        m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                                commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM,
+                                                   skydio::MAV_RESULT_IN_PROGRESS ) );
+        std::this_thread::sleep_for( 200ms );
+    }
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, ArmInProgressThenTerminalRejectionFails )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().arm( true ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_IN_PROGRESS ) );
+    std::this_thread::sleep_for( 300ms );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, 4 ) ); // MAV_RESULT_DENIED
+    EXPECT_FALSE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, ArmInProgressWithoutTerminalAckTimesOut )
+{
+    const auto start  = std::chrono::steady_clock::now();
+    auto result = std::async( std::launch::async, [&]()
+                              { return client().sendCommand( skydio::MAV_CMD_COMPONENT_ARM_DISARM, 1.f,
+                                                             0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 400ms, 2 ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_IN_PROGRESS ) );
+    EXPECT_FALSE( result.get() );
+
+    // Bounded by the overall command deadline, not open-ended.
+    EXPECT_LT( std::chrono::steady_clock::now() - start, 5s );
+}
+
+TEST_F( MavlinkClientTest, UnrelatedCommandAckIgnoredWhileWaitingForArm )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().arm( true ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_MISSION_START, skydio::MAV_RESULT_ACCEPTED ) );
+    std::this_thread::sleep_for( 300ms );
+    EXPECT_NE( result.wait_for( 0s ), std::future_status::ready ); // still waiting
+
+    m_vehicle->sendMessage( skydio::MSG_COMMAND_ACK,
+                            commandAckPayload( skydio::MAV_CMD_COMPONENT_ARM_DISARM, skydio::MAV_RESULT_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+// ---- mission protocol packet loss / retransmission --------------------------
+
+TEST_F( MavlinkClientTest, MissionUploadAnswersDuplicateRequest )
+{
+    std::vector<skydio::MissionItem> plan( 2 );
+    plan[0].seq = 0;
+    plan[1].seq = 1;
+    auto result = std::async( std::launch::async, [&]() { return client().uploadMission( plan, 10s ); } );
+
+    Frame count;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_COUNT, count ) );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+    Frame item;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, item ) );
+    EXPECT_EQ( readField<uint16_t>( item.payload, 28 ), 0 );
+
+    // Duplicate request for seq 0 (e.g. our item got lost): answered again.
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+    Frame dup;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, dup ) );
+    EXPECT_EQ( readField<uint16_t>( dup.payload, 28 ), 0 );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 1 ) );
+    Frame last;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, last ) );
+    EXPECT_EQ( readField<uint16_t>( last.payload, 28 ), 1 );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, MissionUploadRetransmitsItemWhenNextRequestLost )
+{
+    std::vector<skydio::MissionItem> plan( 2 );
+    plan[0].seq = 0;
+    plan[1].seq = 1;
+    auto result = std::async( std::launch::async, [&]() { return client().uploadMission( plan, 10s ); } );
+
+    Frame count;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_COUNT, count ) );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+    Frame item;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, item ) );
+
+    // Simulate the vehicle's MISSION_REQUEST_INT(1) being lost: the node
+    // must retransmit the previous item within the ~250 ms item timing.
+    Frame retransmit;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, retransmit, 1500ms ) );
+    EXPECT_EQ( readField<uint16_t>( retransmit.payload, 28 ), 0 );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 1 ) );
+    Frame last;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, last ) );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, MissionUploadRetransmitsLastItemWhenFinalAckLost )
+{
+    std::vector<skydio::MissionItem> plan( 1 );
+    auto result = std::async( std::launch::async, [&]() { return client().uploadMission( plan, 10s ); } );
+
+    Frame count;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_COUNT, count ) );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+    Frame item;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, item ) );
+
+    // Final MISSION_ACK "lost": the node retransmits the last item within
+    // the ~1500 ms protocol timing, then the (re)sent ACK completes it.
+    Frame retransmit;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, retransmit, 2500ms ) );
+    EXPECT_EQ( readField<uint16_t>( retransmit.payload, 28 ), 0 );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, MissionUploadRetryExhaustionMidTransactionFails )
+{
+    std::vector<skydio::MissionItem> plan( 2 );
+    auto result = std::async( std::launch::async, [&]() { return client().uploadMission( plan, 20s ); } );
+
+    Frame count;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_COUNT, count ) );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+
+    // Never request seq 1 and never ACK: the node retransmits item 0 up to
+    // MISSION_MAX_RETRIES times and then fails well before the 20 s budget.
+    int itemFrames = 0;
+    Frame item;
+    while ( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, item, 1500ms ) )
+        ++itemFrames;
+    EXPECT_EQ( itemFrames, 1 + skydio::MISSION_MAX_RETRIES );
+    EXPECT_FALSE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, MissionUploadIgnoresOutOfRangeRequest )
+{
+    std::vector<skydio::MissionItem> plan( 1 );
+    auto result = std::async( std::launch::async, [&]() { return client().uploadMission( plan, 10s ); } );
+
+    Frame count;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_COUNT, count ) );
+
+    // Malformed/out-of-range request: must not be answered or corrupt state.
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 999 ) );
+    Frame bogus;
+    EXPECT_FALSE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, bogus, 200ms ) );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_REQUEST_INT, missionRequestIntPayload( 0 ) );
+    Frame item;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_ITEM_INT, item ) );
+    EXPECT_EQ( readField<uint16_t>( item.payload, 28 ), 0 );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+// ---- MISSION_CLEAR_ALL reliability ------------------------------------------
+
+TEST_F( MavlinkClientTest, ClearMissionRetriesWhenAckLost )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().clearMission( 15s ); } );
+
+    Frame first;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, first ) );
+    // Ignore the first CLEAR_ALL (simulated loss); expect a retry.
+    Frame second;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, second, 2500ms ) );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, ClearMissionMultipleLossesThenSuccess )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().clearMission( 15s ); } );
+
+    Frame frame;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame ) );
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame, 2500ms ) );
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame, 2500ms ) );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, ClearMissionRetryExhaustionFails )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().clearMission( 4s ); } );
+
+    int clears = 0;
+    Frame frame;
+    while ( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame, 2500ms ) )
+        ++clears;
+    EXPECT_GE( clears, 2 );
+    EXPECT_FALSE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, ClearMissionExplicitRejectionFails )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().clearMission( 10s ); } );
+
+    Frame frame;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame ) );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( 1 ) ); // MAV_MISSION_ERROR
+    EXPECT_FALSE( result.get() );
+
+    // A terminal rejection must not trigger further retries.
+    Frame extra;
+    EXPECT_FALSE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, extra, 500ms ) );
+}
+
+TEST_F( MavlinkClientTest, ClearMissionIgnoresUnrelatedMissionMessages )
+{
+    auto result = std::async( std::launch::async, [&]() { return client().clearMission( 10s ); } );
+
+    Frame frame;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_MISSION_CLEAR_ALL, frame ) );
+
+    // Unrelated mission traffic while waiting for the clear ACK.
+    std::vector<uint8_t> current( 2, 0 );
+    writeField<uint16_t>( current, 0, 2 );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_CURRENT, current );
+    std::vector<uint8_t> reached( 2, 0 );
+    writeField<uint16_t>( reached, 0, 1 );
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ITEM_REACHED, reached );
+    std::this_thread::sleep_for( 200ms );
+    EXPECT_NE( result.wait_for( 0s ), std::future_status::ready );
+
+    m_vehicle->sendMessage( skydio::MSG_MISSION_ACK, missionAckPayload( skydio::MAV_MISSION_ACCEPTED ) );
+    EXPECT_TRUE( result.get() );
+}
+
+// ---- link health / lifecycle ------------------------------------------------
+
+TEST_F( MavlinkClientTest, HeartbeatTimeoutClearsLinkHealth )
+{
+    Frame frame;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_HEARTBEAT, frame ) );
+
+    m_vehicle->sendMessage( skydio::MSG_HEARTBEAT, heartbeatPayload( 0 ) );
+    ASSERT_TRUE( client().waitForHeartbeat( 3000ms ) );
+
+    // No further vehicle heartbeats: health must drop after the 5 s window.
+    const auto deadline = std::chrono::steady_clock::now() + 8s;
+    while ( client().getTelemetry().heartbeatOk && std::chrono::steady_clock::now() < deadline )
+        std::this_thread::sleep_for( 100ms );
+    EXPECT_FALSE( client().getTelemetry().heartbeatOk );
+}
+
+TEST_F( MavlinkClientTest, DisconnectWhileCommandPendingIsSafe )
+{
+    auto result = std::async( std::launch::async, [&]()
+                              { return client().sendCommand( skydio::MAV_CMD_COMPONENT_ARM_DISARM, 1.f,
+                                                             0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 500ms, 1 ); } );
+
+    Frame cmd;
+    ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_COMMAND_LONG, cmd ) );
+    client().disconnect(); // shut the socket down under the pending command
+    EXPECT_FALSE( result.get() );
+}
+
+TEST_F( MavlinkClientTest, RepeatedConnectDisconnectCycles )
+{
+    for ( int cycle = 0; cycle < 3; ++cycle )
+    {
+        client().disconnect();
+        ASSERT_TRUE( client().connect() );
+        Frame frame;
+        ASSERT_TRUE( m_vehicle->waitForMessage( skydio::MSG_HEARTBEAT, frame ) );
+    }
+}
+
 } // namespace

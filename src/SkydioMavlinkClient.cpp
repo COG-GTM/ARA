@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -265,26 +266,42 @@ bool SkydioMavlinkClient::uploadMission( const std::vector<MissionItem> & items,
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
+    uint64_t seenRequestCounter = 0;
     {
         std::lock_guard<std::mutex> lock( m_stateMutex );
         m_missionRequestSeq = -1;
         m_missionAckType    = -1;
+        seenRequestCounter  = m_missionRequestCounter;
     }
 
+    // Explicit, state-aware Mission Protocol transaction with bounded
+    // retransmission per the RAS-A ICD: on a response timeout the previous
+    // message (MISSION_COUNT before the first request, otherwise the last
+    // MISSION_ITEM_INT) is retransmitted, up to MISSION_MAX_RETRIES per
+    // stage. Duplicate requests are answered again; retries reset whenever
+    // the transaction makes forward progress.
     sendMissionCount( static_cast<uint16_t>( items.size() ) );
 
-    int lastSentSeq = -1;
+    int lastSentSeq   = -1;
+    int stageRetries  = 0;
     while ( std::chrono::steady_clock::now() < deadline )
     {
-        int requestSeq = -1;
-        int ackType    = -1;
+        const auto stageTimeout = ( lastSentSeq < 0 ) ? PROTOCOL_RESPONSE_TIMEOUT
+                                : ( lastSentSeq + 1 < static_cast<int>( items.size() ) )
+                                      ? MISSION_ITEM_RESPONSE_TIMEOUT
+                                      : PROTOCOL_RESPONSE_TIMEOUT; // final MISSION_ACK
+
+        int  requestSeq = -1;
+        int  ackType    = -1;
+        bool progressed = false;
         {
             std::unique_lock<std::mutex> lock( m_stateMutex );
-            m_stateCondition.wait_for( lock, std::chrono::milliseconds( 500 ), [this]()
-                                       { return m_missionRequestSeq >= 0 || m_missionAckType >= 0; } );
-            requestSeq          = m_missionRequestSeq;
-            ackType             = m_missionAckType;
-            m_missionRequestSeq = -1;
+            progressed = m_stateCondition.wait_for( lock, stageTimeout, [this, seenRequestCounter]()
+                                                    { return m_missionRequestCounter != seenRequestCounter ||
+                                                             m_missionAckType >= 0; } );
+            seenRequestCounter = m_missionRequestCounter;
+            requestSeq         = m_missionRequestSeq;
+            ackType            = m_missionAckType;
         }
 
         if ( ackType >= 0 )
@@ -300,15 +317,33 @@ bool SkydioMavlinkClient::uploadMission( const std::vector<MissionItem> & items,
             return false;
         }
 
+        if ( !progressed )
+        {
+            // Response timeout: retransmit the previous message.
+            if ( ++stageRetries > MISSION_MAX_RETRIES )
+            {
+                std::cerr << RED << "[SkydioMavlinkClient] mission upload retries exhausted" << NORMAL << std::endl;
+                return false;
+            }
+            if ( lastSentSeq < 0 )
+                sendMissionCount( static_cast<uint16_t>( items.size() ) );
+            else
+                sendMissionItemInt( items[lastSentSeq] );
+            continue;
+        }
+
         if ( requestSeq >= 0 && requestSeq < static_cast<int>( items.size() ) )
         {
+            // New request or duplicate of an earlier one: answer it either way.
+            if ( requestSeq > lastSentSeq )
+                stageRetries = 0; // forward progress
             sendMissionItemInt( items[requestSeq] );
-            lastSentSeq = requestSeq;
+            lastSentSeq = std::max( lastSentSeq, requestSeq );
         }
-        else if ( requestSeq < 0 && lastSentSeq < 0 )
+        else
         {
-            // No request yet - re-announce the count (lossy link retry).
-            sendMissionCount( static_cast<uint16_t>( items.size() ) );
+            std::cerr << YELLOW << "[SkydioMavlinkClient] ignoring out-of-range mission request seq "
+                      << requestSeq << NORMAL << std::endl;
         }
     }
 
@@ -318,17 +353,40 @@ bool SkydioMavlinkClient::uploadMission( const std::vector<MissionItem> & items,
 
 bool SkydioMavlinkClient::clearMission( std::chrono::milliseconds timeout )
 {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    for ( int attempt = 0; attempt <= MISSION_MAX_RETRIES; ++attempt )
     {
-        std::lock_guard<std::mutex> lock( m_stateMutex );
-        m_missionAckType = -1;
+        {
+            std::lock_guard<std::mutex> lock( m_stateMutex );
+            m_missionAckType = -1;
+        }
+
+        uint8_t payload[3] = { m_targetSystem, m_targetComponent, MAV_MISSION_TYPE_MISSION };
+        sendMessage( MSG_MISSION_CLEAR_ALL, payload, sizeof( payload ) );
+
+        auto waitUntil = std::chrono::steady_clock::now() + PROTOCOL_RESPONSE_TIMEOUT;
+        if ( waitUntil > deadline )
+            waitUntil = deadline;
+
+        std::unique_lock<std::mutex> lock( m_stateMutex );
+        const bool acked = m_stateCondition.wait_until( lock, waitUntil, [this]()
+                                                        { return m_missionAckType >= 0; } );
+        if ( acked )
+        {
+            if ( m_missionAckType == MAV_MISSION_ACCEPTED )
+                return true;
+            std::cerr << RED << "[SkydioMavlinkClient] MISSION_CLEAR_ALL rejected, MAV_MISSION_RESULT = "
+                      << m_missionAckType << NORMAL << std::endl;
+            return false;
+        }
+
+        if ( std::chrono::steady_clock::now() >= deadline )
+            break;
     }
 
-    uint8_t payload[3] = { m_targetSystem, m_targetComponent, MAV_MISSION_TYPE_MISSION };
-    sendMessage( MSG_MISSION_CLEAR_ALL, payload, sizeof( payload ) );
-
-    std::unique_lock<std::mutex> lock( m_stateMutex );
-    return m_stateCondition.wait_for( lock, timeout, [this]()
-                                      { return m_missionAckType == MAV_MISSION_ACCEPTED; } );
+    std::cerr << RED << "[SkydioMavlinkClient] MISSION_CLEAR_ALL not acknowledged" << NORMAL << std::endl;
+    return false;
 }
 
 bool SkydioMavlinkClient::sendCommand( uint16_t command,
@@ -337,6 +395,10 @@ bool SkydioMavlinkClient::sendCommand( uint16_t command,
                                        std::chrono::milliseconds timeout,
                                        int retries )
 {
+    // Overall bound: even a command that keeps reporting IN_PROGRESS may
+    // not be waited on forever if the terminal COMMAND_ACK never arrives.
+    const auto hardDeadline = std::chrono::steady_clock::now() + timeout * ( retries + 1 );
+
     for ( int attempt = 0; attempt < retries; ++attempt )
     {
         {
@@ -360,12 +422,35 @@ bool SkydioMavlinkClient::sendCommand( uint16_t command,
         sendMessage( MSG_COMMAND_LONG, payload, sizeof( payload ) );
 
         std::unique_lock<std::mutex> lock( m_stateMutex );
-        const bool acked = m_stateCondition.wait_for( lock, timeout, [this, command]()
-                                                      { return m_commandAckCmd == command; } );
-        if ( acked )
+        auto waitUntil = std::min( std::chrono::steady_clock::now() + timeout, hardDeadline );
+        while ( true )
         {
+            const bool acked = m_stateCondition.wait_until( lock, waitUntil, [this, command]()
+                                                            { return m_commandAckCmd == command; } );
+            if ( !acked )
+            {
+                if ( std::chrono::steady_clock::now() >= hardDeadline )
+                {
+                    std::cerr << RED << "[SkydioMavlinkClient] MAV_CMD " << command
+                              << " still in progress at timeout" << NORMAL << std::endl;
+                    return false;
+                }
+                break; // no ACK at all within this attempt: retransmit
+            }
+
             if ( m_commandAckResult == MAV_RESULT_ACCEPTED )
                 return true;
+
+            if ( m_commandAckResult == MAV_RESULT_IN_PROGRESS )
+            {
+                // Long-running command (e.g. arming): keep waiting for the
+                // terminal COMMAND_ACK without failing or retransmitting.
+                m_commandAckCmd    = -1;
+                m_commandAckResult = -1;
+                waitUntil = hardDeadline;
+                continue;
+            }
+
             std::cerr << RED << "[SkydioMavlinkClient] MAV_CMD " << command
                       << " rejected, MAV_RESULT = " << m_commandAckResult << NORMAL << std::endl;
             return false;
@@ -529,6 +614,7 @@ void SkydioMavlinkClient::handleMessage( uint32_t msgId, const uint8_t * payload
         case MSG_MISSION_REQUEST:
         case MSG_MISSION_REQUEST_INT:
             m_missionRequestSeq = get<uint16_t>( payload, 0 );
+            ++m_missionRequestCounter;
             break;
         case MSG_MISSION_ACK:
             m_missionAckType = payload[2];

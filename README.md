@@ -49,8 +49,8 @@ signal data or the `waypoint_list` config parameter, and are encoded as
 | Key | Default | Description |
 |---|---|---|
 | `UDP_RX_PORT`, `UDP_HOSTS_FILE` | `5001`, `./hosts.json` | MPMS-side comms |
-| `SKYDIO_VEHICLE_IP` | `192.168.10.1` | X10D control link address |
-| `SKYDIO_VEHICLE_PORT` | `14550` | X10D MAVLink UDP port |
+| `SKYDIO_VEHICLE_IP` | `192.168.42.10` | X10D control link address |
+| `SKYDIO_VEHICLE_PORT` | `15667` | X10D MAVLink UDP port |
 | `SKYDIO_LOCAL_PORT` | `14551` | Local bind port for the MAVLink socket |
 | `SKYDIO_GCS_SYSTEM_ID` | `255` | System id this node uses on the link |
 | `SKYDIO_TARGET_SYSTEM_ID` | `1` | X10D system id |
